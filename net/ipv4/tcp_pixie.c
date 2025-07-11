@@ -2,7 +2,7 @@
 #include <net/tcp.h>
 #include <linux/inet.h>
 
-static int rate = 100000000;
+static int rate = 900000000;
 module_param(rate, int, 0644);
 static int feedback = 2;
 module_param(feedback, int, 0644);
