@@ -702,3 +702,9 @@ config TCP_MD5SIG
 	  on the Internet.
 
 	  If unsure, say N.
+
+config TCP_CONG_PIXIE
+	tristate "PIXIE TCP"
+	default n
+	help
+	  PIXIE TCP congestion control algorithm.
