@@ -155,7 +155,7 @@ static void bictcp_cwnd_event(struct sock *sk, enum tcp_ca_event event)
 {
 	if (event == CA_EVENT_TX_START) {
 		struct bictcp *ca = inet_csk_ca(sk);
-		u32 now = tcp_time_stamp;
+		u32 now = tcp_jiffies32;
 		s32 delta;
 
 		delta = now - tcp_sk(sk)->lsndtime;
@@ -231,21 +231,21 @@ static inline void bictcp_update(struct bictcp *ca, u32 cwnd, u32 acked)
 	ca->ack_cnt += acked;	/* count the number of ACKed packets */
 
 	if (ca->last_cwnd == cwnd &&
-	    (s32)(tcp_time_stamp - ca->last_time) <= HZ / 32)
+	    (s32)(tcp_jiffies32 - ca->last_time) <= HZ / 32)
 		return;
 
 	/* The CUBIC function can update ca->cnt at most once per jiffy.
 	 * On all cwnd reduction events, ca->epoch_start is set to 0,
 	 * which will force a recalculation of ca->cnt.
 	 */
-	if (ca->epoch_start && tcp_time_stamp == ca->last_time)
+	if (ca->epoch_start && tcp_jiffies32 == ca->last_time)
 		goto tcp_friendliness;
 
 	ca->last_cwnd = cwnd;
-	ca->last_time = tcp_time_stamp;
+	ca->last_time = tcp_jiffies32;
 
 	if (ca->epoch_start == 0) {
-		ca->epoch_start = tcp_time_stamp;	/* record beginning */
+		ca->epoch_start = tcp_jiffies32;	/* record beginning */
 		ca->ack_cnt = acked;			/* start counting */
 		ca->tcp_cwnd = cwnd;			/* syn with cubic */
 
@@ -276,7 +276,7 @@ static inline void bictcp_update(struct bictcp *ca, u32 cwnd, u32 acked)
 	 * if the cwnd < 1 million packets !!!
 	 */
 
-	t = (s32)(tcp_time_stamp - ca->epoch_start);
+	t = (s32)(tcp_jiffies32 - ca->epoch_start);
 	t += msecs_to_jiffies(ca->delay_min >> 3);
 	/* change the unit from HZ to bictcp_HZ */
 	t <<= BICTCP_HZ;
@@ -440,21 +440,21 @@ static void hystart_update(struct sock *sk, u32 delay)
 /* Track delayed acknowledgment ratio using sliding window
  * ratio = (15*ratio + sample) / 16
  */
-static void bictcp_acked(struct sock *sk, u32 cnt, s32 rtt_us)
+static void bictcp_acked(struct sock *sk, const struct ack_sample *sample)
 {
 	const struct tcp_sock *tp = tcp_sk(sk);
 	struct bictcp *ca = inet_csk_ca(sk);
 	u32 delay;
 
 	/* Some calls are for duplicates without timetamps */
-	if (rtt_us < 0)
+	if (sample->rtt_us < 0)
 		return;
 
 	/* Discard delay samples right after fast recovery */
-	if (ca->epoch_start && (s32)(tcp_time_stamp - ca->epoch_start) < HZ)
+	if (ca->epoch_start && (s32)(tcp_jiffies32 - ca->epoch_start) < HZ)
 		return;
 
-	delay = (rtt_us << 3) / USEC_PER_MSEC;
+	delay = (sample->rtt_us << 3) / USEC_PER_MSEC;
 	if (delay == 0)
 		delay = 1;
 

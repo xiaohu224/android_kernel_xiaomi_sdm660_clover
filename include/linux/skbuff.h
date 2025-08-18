@@ -22,6 +22,7 @@
 #include <linux/cache.h>
 #include <linux/rbtree.h>
 #include <linux/socket.h>
+#include <linux/refcount.h>
 
 #include <linux/atomic.h>
 #include <asm/types.h>
@@ -40,11 +41,55 @@
 #include <linux/if_packet.h>
 #include <net/flow.h>
 
-/* A. Checksumming of received packets by device.
+/* The interface for checksum offload between the stack and networking drivers
+ * is as follows...
+ *
+ * A. IP checksum related features
+ *
+ * Drivers advertise checksum offload capabilities in the features of a device.
+ * From the stack's point of view these are capabilities offered by the driver,
+ * a driver typically only advertises features that it is capable of offloading
+ * to its device.
+ *
+ * The checksum related features are:
+ *
+ *	NETIF_F_HW_CSUM	- The driver (or its device) is able to compute one
+ *			  IP (one's complement) checksum for any combination
+ *			  of protocols or protocol layering. The checksum is
+ *			  computed and set in a packet per the CHECKSUM_PARTIAL
+ *			  interface (see below).
+ *
+ *	NETIF_F_IP_CSUM - Driver (device) is only able to checksum plain
+ *			  TCP or UDP packets over IPv4. These are specifically
+ *			  unencapsulated packets of the form IPv4|TCP or
+ *			  IPv4|UDP where the Protocol field in the IPv4 header
+ *			  is TCP or UDP. The IPv4 header may contain IP options
+ *			  This feature cannot be set in features for a device
+ *			  with NETIF_F_HW_CSUM also set. This feature is being
+ *			  DEPRECATED (see below).
+ *
+ *	NETIF_F_IPV6_CSUM - Driver (device) is only able to checksum plain
+ *			  TCP or UDP packets over IPv6. These are specifically
+ *			  unencapsulated packets of the form IPv6|TCP or
+ *			  IPv4|UDP where the Next Header field in the IPv6
+ *			  header is either TCP or UDP. IPv6 extension headers
+ *			  are not supported with this feature. This feature
+ *			  cannot be set in features for a device with
+ *			  NETIF_F_HW_CSUM also set. This feature is being
+ *			  DEPRECATED (see below).
+ *
+ *	NETIF_F_RXCSUM - Driver (device) performs receive checksum offload.
+ *			 This flag is used only used to disable the RX checksum
+ *			 feature for a device. The stack will accept receive
+ *			 checksum indication in packets received on a device
+ *			 regardless of whether NETIF_F_RXCSUM is set.
+ *
+ * B. Checksumming of received packets by device. Indication of checksum
+ *    verification is in set skb->ip_summed. Possible values are:
  *
  * CHECKSUM_NONE:
  *
- *   Device failed to checksum this packet e.g. due to lack of capabilities.
+ *   Device did not checksum this packet e.g. due to lack of capabilities.
  *   The packet contains full (though not verified) checksum in packet but
  *   not in skb->csum. Thus, skb->csum is undefined in this case.
  *
@@ -54,9 +99,8 @@
  *   (as in CHECKSUM_COMPLETE), but it does parse headers and verify checksums
  *   for specific protocols. For such packets it will set CHECKSUM_UNNECESSARY
  *   if their checksums are okay. skb->csum is still undefined in this case
- *   though. It is a bad option, but, unfortunately, nowadays most vendors do
- *   this. Apparently with the secret goal to sell you new devices, when you
- *   will add new protocol to your host, f.e. IPv6 8)
+ *   though. A driver or device must never modify the checksum field in the
+ *   packet even if checksum is verified.
  *
  *   CHECKSUM_UNNECESSARY is applicable to following protocols:
  *     TCP: IPv6 and IPv4.
@@ -97,40 +141,77 @@
  *   packet that are after the checksum being offloaded are not considered to
  *   be verified.
  *
- * B. Checksumming on output.
+ * C. Checksumming on transmit for non-GSO. The stack requests checksum offload
+ *    in the skb->ip_summed for a packet. Values are:
+ *
+ * CHECKSUM_PARTIAL:
+ *
+ *   The driver is required to checksum the packet as seen by hard_start_xmit()
+ *   from skb->csum_start up to the end, and to record/write the checksum at
+ *   offset skb->csum_start + skb->csum_offset. A driver may verify that the
+ *   csum_start and csum_offset values are valid values given the length and
+ *   offset of the packet, however they should not attempt to validate that the
+ *   checksum refers to a legitimate transport layer checksum-- it is the
+ *   purview of the stack to validate that csum_start and csum_offset are set
+ *   correctly.
+ *
+ *   When the stack requests checksum offload for a packet, the driver MUST
+ *   ensure that the checksum is set correctly. A driver can either offload the
+ *   checksum calculation to the device, or call skb_checksum_help (in the case
+ *   that the device does not support offload for a particular checksum).
+ *
+ *   NETIF_F_IP_CSUM and NETIF_F_IPV6_CSUM are being deprecated in favor of
+ *   NETIF_F_HW_CSUM. New devices should use NETIF_F_HW_CSUM to indicate
+ *   checksum offload capability. If a	device has limited checksum capabilities
+ *   (for instance can only perform NETIF_F_IP_CSUM or NETIF_F_IPV6_CSUM as
+ *   described above) a helper function can be called to resolve
+ *   CHECKSUM_PARTIAL. The helper functions are skb_csum_off_chk*. The helper
+ *   function takes a spec argument that describes the protocol layer that is
+ *   supported for checksum offload and can be called for each packet. If a
+ *   packet does not match the specification for offload, skb_checksum_help
+ *   is called to resolve the checksum.
  *
  * CHECKSUM_NONE:
  *
  *   The skb was already checksummed by the protocol, or a checksum is not
  *   required.
  *
- * CHECKSUM_PARTIAL:
- *
- *   The device is required to checksum the packet as seen by hard_start_xmit()
- *   from skb->csum_start up to the end, and to record/write the checksum at
- *   offset skb->csum_start + skb->csum_offset.
- *
- *   The device must show its capabilities in dev->features, set up at device
- *   setup time, e.g. netdev_features.h:
- *
- *	NETIF_F_HW_CSUM	- It's a clever device, it's able to checksum everything.
- *	NETIF_F_IP_CSUM - Device is dumb, it's able to checksum only TCP/UDP over
- *			  IPv4. Sigh. Vendors like this way for an unknown reason.
- *			  Though, see comment above about CHECKSUM_UNNECESSARY. 8)
- *	NETIF_F_IPV6_CSUM - About as dumb as the last one but does IPv6 instead.
- *	NETIF_F_...     - Well, you get the picture.
- *
  * CHECKSUM_UNNECESSARY:
  *
- *   Normally, the device will do per protocol specific checksumming. Protocol
- *   implementations that do not want the NIC to perform the checksum
- *   calculation should use this flag in their outgoing skbs.
+ *   This has the same meaning on as CHECKSUM_NONE for checksum offload on
+ *   output.
  *
- *	NETIF_F_FCOE_CRC - This indicates that the device can do FCoE FC CRC
- *			   offload. Correspondingly, the FCoE protocol driver
- *			   stack should use CHECKSUM_UNNECESSARY.
+ * CHECKSUM_COMPLETE:
+ *   Not used in checksum output. If a driver observes a packet with this value
+ *   set in skbuff, if should treat as CHECKSUM_NONE being set.
  *
- * Any questions? No questions, good.		--ANK
+ * D. Non-IP checksum (CRC) offloads
+ *
+ *   NETIF_F_SCTP_CRC - This feature indicates that a device is capable of
+ *     offloading the SCTP CRC in a packet. To perform this offload the stack
+ *     will set ip_summed to CHECKSUM_PARTIAL and set csum_start and csum_offset
+ *     accordingly. Note the there is no indication in the skbuff that the
+ *     CHECKSUM_PARTIAL refers to an SCTP checksum, a driver that supports
+ *     both IP checksum offload and SCTP CRC offload must verify which offload
+ *     is configured for a packet presumably by inspecting packet headers.
+ *
+ *   NETIF_F_FCOE_CRC - This feature indicates that a device is capable of
+ *     offloading the FCOE CRC in a packet. To perform this offload the stack
+ *     will set ip_summed to CHECKSUM_PARTIAL and set csum_start and csum_offset
+ *     accordingly. Note the there is no indication in the skbuff that the
+ *     CHECKSUM_PARTIAL refers to an FCOE checksum, a driver that supports
+ *     both IP checksum offload and FCOE CRC offload must verify which offload
+ *     is configured for a packet presumably by inspecting packet headers.
+ *
+ * E. Checksumming on output with GSO.
+ *
+ * In the case of a GSO packet (skb_is_gso(skb) is true), checksum offload
+ * is implied by the SKB_GSO_* flags in gso_type. Most obviously, if the
+ * gso_type is SKB_GSO_TCPV4 or SKB_GSO_TCPV6, TCP checksum offload as
+ * part of the GSO operation is implied. If a checksum is being offloaded
+ * with GSO then ip_summed is CHECKSUM_PARTIAL, csum_start and csum_offset
+ * are set to refer to the outermost checksum being offload (two offloaded
+ * checksums are possible with UDP encapsulation).
  */
 
 /* Don't change this without changing skb_csum_unnecessary! */
@@ -160,6 +241,8 @@ struct scatterlist;
 struct pipe_inode_info;
 struct iov_iter;
 struct napi_struct;
+struct bpf_prog;
+union bpf_attr;
 
 #if defined(CONFIG_NF_CONNTRACK) || defined(CONFIG_NF_CONNTRACK_MODULE)
 struct nf_conntrack {
@@ -262,6 +345,42 @@ static inline void skb_frag_size_sub(skb_frag_t *frag, int delta)
 	frag->size -= delta;
 }
 
+static inline bool skb_frag_must_loop(struct page *p)
+{
+#if defined(CONFIG_HIGHMEM)
+	if (PageHighMem(p))
+		return true;
+#endif
+	return false;
+}
+
+/**
+ *	skb_frag_foreach_page - loop over pages in a fragment
+ *
+ *	@f:		skb frag to operate on
+ *	@f_off:		offset from start of f->page.p
+ *	@f_len:		length from f_off to loop over
+ *	@p:		(temp var) current page
+ *	@p_off:		(temp var) offset from start of current page,
+ *	                           non-zero only on first page.
+ *	@p_len:		(temp var) length in current page,
+ *				   < PAGE_SIZE only on first and last page.
+ *	@copied:	(temp var) length so far, excluding current p_len.
+ *
+ *	A fragment can hold a compound page, in which case per-page
+ *	operations, notably kmap_atomic, must be called for each
+ *	regular page.
+ */
+#define skb_frag_foreach_page(f, f_off, f_len, p, p_off, p_len, copied)	\
+	for (p = skb_frag_page(f) + ((f_off) >> PAGE_SHIFT),		\
+	     p_off = (f_off) & (PAGE_SIZE - 1),				\
+	     p_len = skb_frag_must_loop(p) ?				\
+	     min_t(u32, f_len, PAGE_SIZE - p_off) : f_len,		\
+	     copied = 0;						\
+	     copied < f_len;						\
+	     copied += p_len, p++, p_off = 0,				\
+	     p_len = min_t(u32, f_len - copied, PAGE_SIZE))		\
+
 #define HAVE_HW_TIME_STAMP
 
 /**
@@ -308,14 +427,11 @@ enum {
 
 	/* generate software time stamp when entering packet scheduling */
 	SKBTX_SCHED_TSTAMP = 1 << 6,
-
-	/* generate software timestamp on peer data acknowledgment */
-	SKBTX_ACK_TSTAMP = 1 << 7,
 };
 
+#define SKBTX_ZEROCOPY_FRAG	(SKBTX_DEV_ZEROCOPY | SKBTX_SHARED_FRAG)
 #define SKBTX_ANY_SW_TSTAMP	(SKBTX_SW_TSTAMP    | \
-				 SKBTX_SCHED_TSTAMP | \
-				 SKBTX_ACK_TSTAMP)
+				 SKBTX_SCHED_TSTAMP)
 #define SKBTX_ANY_TSTAMP	(SKBTX_HW_TSTAMP | SKBTX_ANY_SW_TSTAMP)
 
 /*
@@ -328,15 +444,56 @@ enum {
  */
 struct ubuf_info {
 	void (*callback)(struct ubuf_info *, bool zerocopy_success);
-	void *ctx;
-	unsigned long desc;
+	union {
+		struct {
+			unsigned long desc;
+			void *ctx;
+		};
+		struct {
+			u32 id;
+			u16 len;
+			u16 zerocopy:1;
+			u32 bytelen;
+		};
+	};
+	refcount_t refcnt;
+
+	struct mmpin {
+		struct user_struct *user;
+		unsigned int num_pg;
+	} mmp;
 };
+
+#define skb_uarg(SKB)	((struct ubuf_info *)(skb_shinfo(SKB)->destructor_arg))
+
+int mm_account_pinned_pages(struct mmpin *mmp, size_t size);
+void mm_unaccount_pinned_pages(struct mmpin *mmp);
+
+struct ubuf_info *sock_zerocopy_alloc(struct sock *sk, size_t size);
+struct ubuf_info *sock_zerocopy_realloc(struct sock *sk, size_t size,
+					struct ubuf_info *uarg);
+
+static inline void sock_zerocopy_get(struct ubuf_info *uarg)
+{
+	refcount_inc(&uarg->refcnt);
+}
+
+void sock_zerocopy_put(struct ubuf_info *uarg);
+void sock_zerocopy_put_abort(struct ubuf_info *uarg, bool have_uref);
+
+void sock_zerocopy_callback(struct ubuf_info *uarg, bool success);
+
+int skb_zerocopy_iter_dgram(struct sk_buff *skb, struct msghdr *msg, int len);
+int skb_zerocopy_iter_stream(struct sock *sk, struct sk_buff *skb,
+			     struct msghdr *msg, int len,
+			     struct ubuf_info *uarg);
 
 /* This data is invariant across clones and lives at
  * the end of the header data, ie. at skb->end.
  */
 struct skb_shared_info {
-	unsigned char	nr_frags;
+	__u8		meta_len;
+	__u8		nr_frags;
 	__u8		tx_flags;
 	unsigned short	gso_size;
 	/* Warning: this field is not always filled in (UFO)! */
@@ -420,66 +577,6 @@ typedef unsigned int sk_buff_data_t;
 typedef unsigned char *sk_buff_data_t;
 #endif
 
-/**
- * struct skb_mstamp - multi resolution time stamps
- * @stamp_us: timestamp in us resolution
- * @stamp_jiffies: timestamp in jiffies
- */
-struct skb_mstamp {
-	union {
-		u64		v64;
-		struct {
-			u32	stamp_us;
-			u32	stamp_jiffies;
-		};
-	};
-};
-
-/**
- * skb_mstamp_get - get current timestamp
- * @cl: place to store timestamps
- */
-static inline void skb_mstamp_get(struct skb_mstamp *cl)
-{
-	u64 val = local_clock();
-
-	do_div(val, NSEC_PER_USEC);
-	cl->stamp_us = (u32)val;
-	cl->stamp_jiffies = (u32)jiffies;
-}
-
-/**
- * skb_mstamp_delta - compute the difference in usec between two skb_mstamp
- * @t1: pointer to newest sample
- * @t0: pointer to oldest sample
- */
-static inline u32 skb_mstamp_us_delta(const struct skb_mstamp *t1,
-				      const struct skb_mstamp *t0)
-{
-	s32 delta_us = t1->stamp_us - t0->stamp_us;
-	u32 delta_jiffies = t1->stamp_jiffies - t0->stamp_jiffies;
-
-	/* If delta_us is negative, this might be because interval is too big,
-	 * or local_clock() drift is too big : fallback using jiffies.
-	 */
-	if (delta_us <= 0 ||
-	    delta_jiffies >= (INT_MAX / (USEC_PER_SEC / HZ)))
-
-		delta_us = jiffies_to_usecs(delta_jiffies);
-
-	return delta_us;
-}
-
-static inline bool skb_mstamp_after(const struct skb_mstamp *t1,
-				    const struct skb_mstamp *t0)
-{
-	s32 diff = t1->stamp_jiffies - t0->stamp_jiffies;
-
-	if (!diff)
-		diff = t1->stamp_us - t0->stamp_us;
-	return diff > 0;
-}
-
 /** 
  *	struct sk_buff - socket buffer
  *	@next: Next buffer in list
@@ -512,6 +609,7 @@ static inline bool skb_mstamp_after(const struct skb_mstamp *t1,
  *	@nf_trace: netfilter packet trace flag
  *	@protocol: Packet protocol from driver
  *	@destructor: Destruct function
+ *	@tcp_tsorted_anchor: list structure for TCP (tp->tsorted_sent_queue)
  *	@nfct: Associated connection, if any
  *	@nf_bridge: Saved data about a bridged frame - see br_netfilter.c
  *	@skb_iif: ifindex of device we arrived on
@@ -559,7 +657,7 @@ struct sk_buff {
 
 			union {
 				ktime_t		tstamp;
-				struct skb_mstamp skb_mstamp;
+				u64		skb_mstamp;
 			};
 		};
 		struct rb_node		rbnode; /* used in netem, ip4 defrag, and tcp stack */
@@ -580,8 +678,14 @@ struct sk_buff {
 	 */
 	char			cb[48] __aligned(8);
 
-	unsigned long		_skb_refdst;
-	void			(*destructor)(struct sk_buff *skb);
+	union {
+		struct {
+			unsigned long	_skb_refdst;
+			void		(*destructor)(struct sk_buff *skb);
+		};
+		struct list_head	tcp_tsorted_anchor;
+	};
+
 #ifdef CONFIG_XFRM
 	struct	sec_path	*sp;
 #endif
@@ -1029,6 +1133,11 @@ void skb_flow_dissector_init(struct flow_dissector *flow_dissector,
 			     const struct flow_dissector_key *key,
 			     unsigned int key_count);
 
+int skb_flow_dissector_bpf_prog_attach(const union bpf_attr *attr,
+ 				       struct bpf_prog *prog);
+
+int skb_flow_dissector_bpf_prog_detach(const union bpf_attr *attr);
+
 bool __skb_flow_dissect(const struct sk_buff *skb,
 			struct flow_dissector *flow_dissector,
 			void *target_container,
@@ -1151,6 +1260,54 @@ static inline struct skb_shared_hwtstamps *skb_hwtstamps(struct sk_buff *skb)
 #define skb_list_walk_safe(first, skb, next_skb)                               \
 	for ((skb) = (first), (next_skb) = (skb) ? (skb)->next : NULL; (skb);  \
 	     (skb) = (next_skb), (next_skb) = (skb) ? (skb)->next : NULL)
+
+static inline struct ubuf_info *skb_zcopy(struct sk_buff *skb)
+{
+	bool is_zcopy = skb && skb_shinfo(skb)->tx_flags & SKBTX_DEV_ZEROCOPY;
+
+	return is_zcopy ? skb_uarg(skb) : NULL;
+}
+
+static inline void skb_zcopy_set(struct sk_buff *skb, struct ubuf_info *uarg,
+				 bool *have_ref)
+{
+	if (skb && uarg && !skb_zcopy(skb)) {
+		if (unlikely(have_ref && *have_ref))
+			*have_ref = false;
+		else
+			sock_zerocopy_get(uarg);
+		skb_shinfo(skb)->destructor_arg = uarg;
+		skb_shinfo(skb)->tx_flags |= SKBTX_ZEROCOPY_FRAG;
+	}
+}
+
+/* Release a reference on a zerocopy structure */
+static inline void skb_zcopy_clear(struct sk_buff *skb, bool zerocopy)
+{
+	struct ubuf_info *uarg = skb_zcopy(skb);
+
+	if (uarg) {
+		if (uarg->callback == sock_zerocopy_callback) {
+			uarg->zerocopy = uarg->zerocopy && zerocopy;
+			sock_zerocopy_put(uarg);
+		} else {
+			uarg->callback(uarg, zerocopy);
+		}
+
+		skb_shinfo(skb)->tx_flags &= ~SKBTX_ZEROCOPY_FRAG;
+	}
+}
+
+/* Abort a zerocopy operation and revert zckey on error in send syscall */
+static inline void skb_zcopy_abort(struct sk_buff *skb)
+{
+	struct ubuf_info *uarg = skb_zcopy(skb);
+
+	if (uarg) {
+		sock_zerocopy_put_abort(uarg, false);
+		skb_shinfo(skb)->tx_flags &= ~SKBTX_ZEROCOPY_FRAG;
+	}
+}
 
 /**
  *	skb_queue_empty - check if a queue is empty
@@ -1736,13 +1893,18 @@ static inline unsigned int skb_headlen(const struct sk_buff *skb)
 	return skb->len - skb->data_len;
 }
 
-static inline int skb_pagelen(const struct sk_buff *skb)
+static inline unsigned int __skb_pagelen(const struct sk_buff *skb)
 {
-	int i, len = 0;
+	unsigned int i, len = 0;
 
-	for (i = (int)skb_shinfo(skb)->nr_frags - 1; i >= 0; i--)
+	for (i = skb_shinfo(skb)->nr_frags - 1; (int)i >= 0; i--)
 		len += skb_frag_size(&skb_shinfo(skb)->frags[i]);
-	return len + skb_headlen(skb);
+	return len;
+}
+
+static inline unsigned int skb_pagelen(const struct sk_buff *skb)
+{
+	return skb_headlen(skb) + __skb_pagelen(skb);
 }
 
 /**
@@ -2013,6 +2175,11 @@ static inline unsigned char *skb_inner_transport_header(const struct sk_buff
 	return skb->head + skb->inner_transport_header;
 }
 
+static inline int skb_inner_transport_offset(const struct sk_buff *skb)
+{
+	return skb_inner_transport_header(skb) - skb->data;
+}
+
 static inline void skb_reset_inner_transport_header(struct sk_buff *skb)
 {
 	skb->inner_transport_header = skb->data - skb->head;
@@ -2099,6 +2266,11 @@ static inline void skb_set_network_header(struct sk_buff *skb, const int offset)
 static inline unsigned char *skb_mac_header(const struct sk_buff *skb)
 {
 	return skb->head + skb->mac_header;
+}
+
+static inline u32 skb_mac_header_len(const struct sk_buff *skb)
+{
+	return skb->network_header - skb->mac_header;
 }
 
 static inline int skb_mac_header_was_set(const struct sk_buff *skb)
@@ -2319,7 +2491,17 @@ static inline void skb_orphan(struct sk_buff *skb)
  */
 static inline int skb_orphan_frags(struct sk_buff *skb, gfp_t gfp_mask)
 {
-	if (likely(!(skb_shinfo(skb)->tx_flags & SKBTX_DEV_ZEROCOPY)))
+	if (likely(!skb_zcopy(skb)))
+		return 0;
+	if (skb_uarg(skb)->callback == sock_zerocopy_callback)
+		return 0;
+	return skb_copy_ubufs(skb, gfp_mask);
+}
+
+/* Frags must be orphaned, even if refcounted, if skb might loop to rx path */
+static inline int skb_orphan_frags_rx(struct sk_buff *skb, gfp_t gfp_mask)
+{
+	if (likely(!skb_zcopy(skb)))
 		return 0;
 	return skb_copy_ubufs(skb, gfp_mask);
 }
@@ -2747,6 +2929,8 @@ static inline int skb_add_data(struct sk_buff *skb,
 static inline bool skb_can_coalesce(struct sk_buff *skb, int i,
 				    const struct page *page, int off)
 {
+	if (skb_zcopy(skb))
+		return false;
 	if (i) {
 		const struct skb_frag_struct *frag = &skb_shinfo(skb)->frags[i - 1];
 
@@ -2911,6 +3095,12 @@ static inline int __skb_grow_rcsum(struct sk_buff *skb, unsigned int len)
 	return __skb_grow(skb, len);
 }
 
+#define rb_to_skb(rb) rb_entry_safe(rb, struct sk_buff, rbnode)
+#define skb_rb_first(root) rb_to_skb(rb_first(root))
+#define skb_rb_last(root)  rb_to_skb(rb_last(root))
+#define skb_rb_next(skb)   rb_to_skb(rb_next(&(skb)->rbnode))
+#define skb_rb_prev(skb)   rb_to_skb(rb_prev(&(skb)->rbnode))
+
 #define skb_queue_walk(queue, skb) \
 		for (skb = (queue)->next;					\
 		     skb != (struct sk_buff *)(queue);				\
@@ -2924,6 +3114,18 @@ static inline int __skb_grow_rcsum(struct sk_buff *skb, unsigned int len)
 #define skb_queue_walk_from(queue, skb)						\
 		for (; skb != (struct sk_buff *)(queue);			\
 		     skb = skb->next)
+
+#define skb_rbtree_walk(skb, root)						\
+		for (skb = skb_rb_first(root); skb != NULL;			\
+		     skb = skb_rb_next(skb))
+
+#define skb_rbtree_walk_from(skb)						\
+		for (; skb != NULL;						\
+		     skb = skb_rb_next(skb))
+
+#define skb_rbtree_walk_from_safe(skb, tmp)					\
+		for (; tmp = skb ? skb_rb_next(skb) : NULL, (skb != NULL);	\
+		     skb = tmp)
 
 #define skb_queue_walk_from_safe(queue, skb, tmp)				\
 		for (tmp = skb->next;						\
@@ -2992,6 +3194,9 @@ int skb_splice_bits(struct sk_buff *skb, struct sock *sk, unsigned int offset,
 		    ssize_t (*splice_cb)(struct sock *,
 					 struct pipe_inode_info *,
 					 struct splice_pipe_desc *));
+int skb_send_sock_locked(struct sock *sk, struct sk_buff *skb, int offset,
+			 int len);
+int skb_send_sock(struct sock *sk, struct sk_buff *skb, int offset, int len);
 void skb_copy_and_csum_dev(const struct sk_buff *skb, u8 *to);
 unsigned int skb_zerocopy_headlen(const struct sk_buff *from);
 int skb_zerocopy(struct sk_buff *to, struct sk_buff *from,
@@ -3135,6 +3340,69 @@ static inline ktime_t net_timedelta(ktime_t t)
 static inline ktime_t net_invalid_timestamp(void)
 {
 	return ktime_set(0, 0);
+}
+
+static inline u8 skb_metadata_len(const struct sk_buff *skb)
+{
+	return skb_shinfo(skb)->meta_len;
+}
+
+static inline void *skb_metadata_end(const struct sk_buff *skb)
+{
+	return skb_mac_header(skb);
+}
+
+static inline bool __skb_metadata_differs(const struct sk_buff *skb_a,
+					  const struct sk_buff *skb_b,
+					  u8 meta_len)
+{
+	const void *a = skb_metadata_end(skb_a);
+	const void *b = skb_metadata_end(skb_b);
+	/* Using more efficient varaiant than plain call to memcmp(). */
+#if defined(CONFIG_HAVE_EFFICIENT_UNALIGNED_ACCESS) && BITS_PER_LONG == 64
+	u64 diffs = 0;
+
+	switch (meta_len) {
+#define __it(x, op) (x -= sizeof(u##op))
+#define __it_diff(a, b, op) (*(u##op *)__it(a, op)) ^ (*(u##op *)__it(b, op))
+	case 32: diffs |= __it_diff(a, b, 64);
+	case 24: diffs |= __it_diff(a, b, 64);
+	case 16: diffs |= __it_diff(a, b, 64);
+	case  8: diffs |= __it_diff(a, b, 64);
+		break;
+	case 28: diffs |= __it_diff(a, b, 64);
+	case 20: diffs |= __it_diff(a, b, 64);
+	case 12: diffs |= __it_diff(a, b, 64);
+	case  4: diffs |= __it_diff(a, b, 32);
+		break;
+	}
+	return diffs;
+#else
+	return memcmp(a - meta_len, b - meta_len, meta_len);
+#endif
+}
+
+static inline bool skb_metadata_differs(const struct sk_buff *skb_a,
+					const struct sk_buff *skb_b)
+{
+	u8 len_a = skb_metadata_len(skb_a);
+	u8 len_b = skb_metadata_len(skb_b);
+
+	if (!(len_a | len_b))
+		return false;
+
+	return len_a != len_b ?
+	       true : __skb_metadata_differs(skb_a, skb_b, len_a);
+}
+
+static inline void skb_metadata_set(struct sk_buff *skb, u8 meta_len)
+{
+	skb_shinfo(skb)->meta_len = meta_len;
+}
+
+static inline void skb_metadata_clear(struct sk_buff *skb)
+{
+	skb_metadata_set(skb, 0);
 }
 
 struct sk_buff *skb_clone_sk(struct sk_buff *skb);

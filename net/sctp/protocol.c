@@ -587,10 +587,11 @@ static int sctp_v4_is_ce(const struct sk_buff *skb)
 
 /* Create and initialize a new sk for the socket returned by accept(). */
 static struct sock *sctp_v4_create_accept_sk(struct sock *sk,
-					     struct sctp_association *asoc)
+					     struct sctp_association *asoc,
+					     bool kern)
 {
 	struct sock *newsk = sk_alloc(sock_net(sk), PF_INET, GFP_KERNEL,
-			sk->sk_prot, 0);
+			sk->sk_prot, kern);
 	struct inet_sock *newinet;
 
 	if (!newsk)
@@ -1428,10 +1429,10 @@ static __init int sctp_init(void)
 	 * The methodology is similar to that of the tcp hash tables.
 	 * Though not identical.  Start by getting a goal size
 	 */
-	if (totalram_pages >= (128 * 1024))
-		goal = totalram_pages >> (22 - PAGE_SHIFT);
+	if (totalram_pages() >= (128 * 1024))
+		goal = totalram_pages() >> (22 - PAGE_SHIFT);
 	else
-		goal = totalram_pages >> (24 - PAGE_SHIFT);
+		goal = totalram_pages() >> (24 - PAGE_SHIFT);
 
 	/* Then compute the page order for said goal */
 	order = get_order(goal);

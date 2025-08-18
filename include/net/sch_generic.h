@@ -15,6 +15,7 @@ struct Qdisc_ops;
 struct qdisc_walker;
 struct tcf_walker;
 struct module;
+struct bpf_flow_keys;
 
 struct qdisc_rate_table {
 	struct tc_ratespec rate;
@@ -168,6 +169,7 @@ struct Qdisc_class_ops {
 
 	/* Filter manipulation */
 	struct tcf_proto __rcu ** (*tcf_chain)(struct Qdisc *, unsigned long);
+	bool			(*tcf_cl_offload)(u32 classid);
 	unsigned long		(*bind_tcf)(struct Qdisc *, unsigned long,
 					u32 classid);
 	void			(*unbind_tcf)(struct Qdisc *, unsigned long);
@@ -252,9 +254,14 @@ struct tcf_proto {
 };
 
 struct qdisc_skb_cb {
-	unsigned int		pkt_len;
-	u16			slave_dev_queue_mapping;
-	u16			tc_classid;
+	union {
+ 		struct {
+ 			unsigned int		pkt_len;
+ 			u16			slave_dev_queue_mapping;
+ 			u16			tc_classid;
+ 		};
+ 		struct bpf_flow_keys *flow_keys;
+ 	};
 #define QDISC_CB_PRIV_LEN 20
 	unsigned char		data[QDISC_CB_PRIV_LEN];
 };

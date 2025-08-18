@@ -56,7 +56,7 @@ struct sock *__inet6_lookup_established(struct net *net,
 					   const __be16 sport,
 					   const struct in6_addr *daddr,
 					   const u16 hnum,
-					   const int dif)
+					   const int dif, const int sdif)
 {
 	struct sock *sk;
 	const struct hlist_nulls_node *node;
@@ -69,17 +69,16 @@ struct sock *__inet6_lookup_established(struct net *net,
 	struct inet_ehash_bucket *head = &hashinfo->ehash[slot];
 
 
-	rcu_read_lock();
 begin:
 	sk_nulls_for_each_rcu(sk, node, &head->chain) {
 		if (sk->sk_hash != hash)
 			continue;
-		if (!INET6_MATCH(sk, net, saddr, daddr, ports, dif))
+		if (!INET6_MATCH(sk, net, saddr, daddr, ports, dif, sdif))
 			continue;
 		if (unlikely(!atomic_inc_not_zero(&sk->sk_refcnt)))
 			goto out;
 
-		if (unlikely(!INET6_MATCH(sk, net, saddr, daddr, ports, dif))) {
+		if (unlikely(!INET6_MATCH(sk, net, saddr, daddr, ports, dif, sdif))) {
 			sock_gen_put(sk);
 			goto begin;
 		}
@@ -90,7 +89,6 @@ begin:
 out:
 	sk = NULL;
 found:
-	rcu_read_unlock();
 	return sk;
 }
 EXPORT_SYMBOL(__inet6_lookup_established);
@@ -98,7 +96,7 @@ EXPORT_SYMBOL(__inet6_lookup_established);
 static inline int compute_score(struct sock *sk, struct net *net,
 				const unsigned short hnum,
 				const struct in6_addr *daddr,
-				const int dif)
+				const int dif, const int sdif, bool exact_dif)
 {
 	int score = -1;
 
@@ -111,10 +109,14 @@ static inline int compute_score(struct sock *sk, struct net *net,
 				return -1;
 			score++;
 		}
-		if (sk->sk_bound_dev_if) {
-			if (sk->sk_bound_dev_if != dif)
+		if (sk->sk_bound_dev_if || exact_dif) {
+			bool dev_match = (sk->sk_bound_dev_if == dif ||
+					  sk->sk_bound_dev_if == sdif);
+
+			if (!dev_match)
 				return -1;
-			score++;
+			if (sk->sk_bound_dev_if)
+				score++;
 		}
 		if (sk->sk_incoming_cpu == raw_smp_processor_id())
 			score++;
@@ -122,46 +124,36 @@ static inline int compute_score(struct sock *sk, struct net *net,
 	return score;
 }
 
+/* called with rcu_read_lock() */
 struct sock *inet6_lookup_listener(struct net *net,
 		struct inet_hashinfo *hashinfo,
 		struct sk_buff *skb, int doff,
 		const struct in6_addr *saddr,
 		const __be16 sport, const struct in6_addr *daddr,
-		const unsigned short hnum, const int dif)
+		const unsigned short hnum, const int dif, const int sdif)
 {
-	struct sock *sk;
-	const struct hlist_nulls_node *node;
-	struct sock *result;
-	int score, hiscore, matches = 0, reuseport = 0;
-	bool select_ok = true;
-	u32 phash = 0;
 	unsigned int hash = inet_lhashfn(net, hnum);
 	struct inet_listen_hashbucket *ilb = &hashinfo->listening_hash[hash];
+	int score, hiscore = 0, matches = 0, reuseport = 0;
+	bool exact_dif = inet6_exact_dif_match(net, skb);
+	struct sock *sk, *result = NULL;
+	u32 phash = 0;
 
-	rcu_read_lock();
-begin:
-	result = NULL;
-	hiscore = 0;
-	sk_nulls_for_each(sk, node, &ilb->head) {
-		score = compute_score(sk, net, hnum, daddr, dif);
+	sk_for_each(sk, &ilb->head) {
+		score = compute_score(sk, net, hnum, daddr, dif, sdif, exact_dif);
 		if (score > hiscore) {
 			hiscore = score;
-			result = sk;
-			reuseport = sk->sk_reuseport;
 			if (reuseport) {
 				phash = inet6_ehashfn(net, daddr, hnum,
 						      saddr, sport);
-				if (select_ok) {
-					struct sock *sk2;
-					sk2 = reuseport_select_sock(sk, phash,
-								    skb, doff);
-					if (sk2) {
-						result = sk2;
-						goto found;
-					}
-				}
+				result = reuseport_select_sock(sk, phash,
+							       skb, doff);
+				if (result)
+					return result;
 				matches = 1;
 			}
+			result = sk;
+			reuseport = sk->sk_reuseport;
 		} else if (score == hiscore && reuseport) {
 			matches++;
 			if (reciprocal_scale(phash, matches) == 0)
@@ -169,25 +161,6 @@ begin:
 			phash = next_pseudo_random32(phash);
 		}
 	}
-	/*
-	 * if the nulls value we got at the end of this lookup is
-	 * not the expected one, we must restart lookup.
-	 * We probably met an item that was moved to another chain.
-	 */
-	if (get_nulls_value(node) != hash + LISTENING_NULLS_BASE)
-		goto begin;
-	if (result) {
-found:
-		if (unlikely(!atomic_inc_not_zero(&result->sk_refcnt)))
-			result = NULL;
-		else if (unlikely(compute_score(result, net, hnum, daddr,
-				  dif) < hiscore)) {
-			sock_put(result);
-			select_ok = false;
-			goto begin;
-		}
-	}
-	rcu_read_unlock();
 	return result;
 }
 EXPORT_SYMBOL_GPL(inet6_lookup_listener);
@@ -199,12 +172,12 @@ struct sock *inet6_lookup(struct net *net, struct inet_hashinfo *hashinfo,
 			  const int dif)
 {
 	struct sock *sk;
+	bool refcounted;
 
-	local_bh_disable();
 	sk = __inet6_lookup(net, hashinfo, skb, doff, saddr, sport, daddr,
-			    ntohs(dport), dif);
-	local_bh_enable();
-
+			    ntohs(dport), dif, 0, &refcounted);
+	if (sk && !refcounted && !atomic_inc_not_zero(&sk->sk_refcnt))
+		sk = NULL;
 	return sk;
 }
 EXPORT_SYMBOL_GPL(inet6_lookup);
@@ -218,8 +191,9 @@ static int __inet6_check_established(struct inet_timewait_death_row *death_row,
 	const struct in6_addr *daddr = &sk->sk_v6_rcv_saddr;
 	const struct in6_addr *saddr = &sk->sk_v6_daddr;
 	const int dif = sk->sk_bound_dev_if;
-	const __portpair ports = INET_COMBINED_PORTS(inet->inet_dport, lport);
 	struct net *net = sock_net(sk);
+	const int sdif = l3mdev_master_ifindex_by_index(net, dif);
+	const __portpair ports = INET_COMBINED_PORTS(inet->inet_dport, lport);
 	const unsigned int hash = inet6_ehashfn(net, daddr, lport, saddr,
 						inet->inet_dport);
 	struct inet_ehash_bucket *head = inet_ehash_bucket(hinfo, hash);
@@ -234,7 +208,8 @@ static int __inet6_check_established(struct inet_timewait_death_row *death_row,
 		if (sk2->sk_hash != hash)
 			continue;
 
-		if (likely(INET6_MATCH(sk2, net, saddr, daddr, ports, dif))) {
+		if (likely(INET6_MATCH(sk2, net, saddr, daddr, ports,
+				       dif, sdif))) {
 			if (sk2->sk_state == TCP_TIME_WAIT) {
 				tw = inet_twsk(sk2);
 				if (twsk_unique(sk, sk2, twp))

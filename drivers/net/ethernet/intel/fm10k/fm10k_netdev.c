@@ -1188,6 +1188,15 @@ int fm10k_setup_tc(struct net_device *dev, u8 tc)
 	return 0;
 }
 
+static int __fm10k_setup_tc(struct net_device *dev, u32 handle, __be16 proto,
+			    struct tc_to_netdev *tc)
+{
+	if (handle != TC_H_ROOT || tc->type != TC_SETUP_MQPRIO)
+		return -EINVAL;
+
+	return fm10k_setup_tc(dev, tc->tc);
+}
+
 static int fm10k_ioctl(struct net_device *netdev, struct ifreq *ifr, int cmd)
 {
 	switch (cmd) {
@@ -1355,7 +1364,7 @@ static netdev_features_t fm10k_features_check(struct sk_buff *skb,
 	if (!skb->encapsulation || fm10k_tx_encap_offload(skb))
 		return features;
 
-	return features & ~(NETIF_F_ALL_CSUM | NETIF_F_GSO_MASK);
+	return features & ~(NETIF_F_CSUM_MASK | NETIF_F_GSO_MASK);
 }
 
 static const struct net_device_ops fm10k_netdev_ops = {
@@ -1370,7 +1379,7 @@ static const struct net_device_ops fm10k_netdev_ops = {
 	.ndo_vlan_rx_kill_vid	= fm10k_vlan_rx_kill_vid,
 	.ndo_set_rx_mode	= fm10k_set_rx_mode,
 	.ndo_get_stats64	= fm10k_get_stats64,
-	.ndo_setup_tc		= fm10k_setup_tc,
+	.ndo_setup_tc		= __fm10k_setup_tc,
 	.ndo_set_vf_mac		= fm10k_ndo_set_vf_mac,
 	.ndo_set_vf_vlan	= fm10k_ndo_set_vf_vlan,
 	.ndo_set_vf_rate	= fm10k_ndo_set_vf_bw,

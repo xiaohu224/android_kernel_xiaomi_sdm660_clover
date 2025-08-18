@@ -221,11 +221,12 @@ void ip_cmsg_recv_offset(struct msghdr *msg, struct sk_buff *skb,
 }
 EXPORT_SYMBOL(ip_cmsg_recv_offset);
 
-int ip_cmsg_send(struct net *net, struct msghdr *msg, struct ipcm_cookie *ipc,
+int ip_cmsg_send(struct sock *sk, struct msghdr *msg, struct ipcm_cookie *ipc,
 		 bool allow_ipv6)
 {
 	int err, val;
 	struct cmsghdr *cmsg;
+	struct net *net = sock_net(sk);
 
 	for_each_cmsghdr(cmsg, msg) {
 		if (!CMSG_OK(msg, cmsg))
@@ -247,6 +248,13 @@ int ip_cmsg_send(struct net *net, struct msghdr *msg, struct ipcm_cookie *ipc,
 			continue;
 		}
 #endif
+		if (cmsg->cmsg_level == SOL_SOCKET) {
+			err = __sock_cmsg_send(sk, msg, cmsg, &ipc->sockc);
+			if (err)
+				return err;
+			continue;
+		}
+
 		if (cmsg->cmsg_level != SOL_IP)
 			continue;
 		switch (cmsg->cmsg_type) {
@@ -1194,7 +1202,18 @@ void ipv4_pktinfo_prepare(const struct sock *sk, struct sk_buff *skb)
 		       ipv6_sk_rxinfo(sk);
 
 	if (prepare && skb_rtable(skb)) {
-		pktinfo->ipi_ifindex = inet_iif(skb);
+		/* skb->cb is overloaded: prior to this point it is IP{6}CB
+		 * which has interface index (iif) as the first member of the
+		 * underlying inet{6}_skb_parm struct. This code then overlays
+		 * PKTINFO_SKB_CB and in_pktinfo also has iif as the first
+		 * element so the iif is picked up from the prior IPCB. If iif
+		 * is the loopback interface, then return the sending interface
+		 * (e.g., process binds socket to eth0 for Tx which is
+		 * redirected to loopback in the rtable/dst).
+		 */
+		if (pktinfo->ipi_ifindex == LOOPBACK_IFINDEX)
+			pktinfo->ipi_ifindex = inet_iif(skb);
+
 		pktinfo->ipi_spec_dst.s_addr = fib_compute_spec_dst(skb);
 	} else {
 		pktinfo->ipi_ifindex = 0;

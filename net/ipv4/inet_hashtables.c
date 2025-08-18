@@ -25,6 +25,7 @@
 #include <net/inet_hashtables.h>
 #include <net/secure_seq.h>
 #include <net/ip.h>
+#include <net/tcp.h>
 #include <net/sock_reuseport.h>
 
 static u32 inet_ehashfn(const struct net *net, const __be32 laddr,
@@ -173,7 +174,7 @@ EXPORT_SYMBOL_GPL(__inet_inherit_port);
 
 static inline int compute_score(struct sock *sk, struct net *net,
 				const unsigned short hnum, const __be32 daddr,
-				const int dif)
+				const int dif, const int sdif, bool exact_dif)
 {
 	int score = -1;
 	struct inet_sock *inet = inet_sk(sk);
@@ -187,10 +188,14 @@ static inline int compute_score(struct sock *sk, struct net *net,
 				return -1;
 			score += 4;
 		}
-		if (sk->sk_bound_dev_if) {
-			if (sk->sk_bound_dev_if != dif)
+		if (sk->sk_bound_dev_if || exact_dif) {
+			bool dev_match = (sk->sk_bound_dev_if == dif ||
+					  sk->sk_bound_dev_if == sdif);
+
+			if (!dev_match)
 				return -1;
-			score += 4;
+			if (sk->sk_bound_dev_if)
+				score += 4;
 		}
 		if (sk->sk_incoming_cpu == raw_smp_processor_id())
 			score++;
@@ -199,52 +204,43 @@ static inline int compute_score(struct sock *sk, struct net *net,
 }
 
 /*
- * Don't inline this cruft. Here are some nice properties to exploit here. The
- * BSD API does not allow a listening sock to specify the remote port nor the
+ * Here are some nice properties to exploit here. The BSD API
+ * does not allow a listening sock to specify the remote port nor the
  * remote address for the connection. So always assume those are both
  * wildcarded during the search since they can never be otherwise.
  */
 
-
+/* called with rcu_read_lock() : No refcount taken on the socket */
 struct sock *__inet_lookup_listener(struct net *net,
 				    struct inet_hashinfo *hashinfo,
 				    struct sk_buff *skb, int doff,
 				    const __be32 saddr, __be16 sport,
 				    const __be32 daddr, const unsigned short hnum,
-				    const int dif)
+				    const int dif, const int sdif)
 {
-	struct sock *sk, *result;
-	struct hlist_nulls_node *node;
 	unsigned int hash = inet_lhashfn(net, hnum);
 	struct inet_listen_hashbucket *ilb = &hashinfo->listening_hash[hash];
-	int score, hiscore, matches = 0, reuseport = 0;
-	bool select_ok = true;
+	int score, hiscore = 0, matches = 0, reuseport = 0;
+	bool exact_dif = inet_exact_dif_match(net, skb);
+	struct sock *sk, *result = NULL;
 	u32 phash = 0;
 
-	rcu_read_lock();
-begin:
-	result = NULL;
-	hiscore = 0;
-	sk_nulls_for_each_rcu(sk, node, &ilb->head) {
-		score = compute_score(sk, net, hnum, daddr, dif);
+	sk_for_each_rcu(sk, &ilb->head) {
+		score = compute_score(sk, net, hnum, daddr,
+				      dif, sdif, exact_dif);
 		if (score > hiscore) {
-			result = sk;
-			hiscore = score;
 			reuseport = sk->sk_reuseport;
 			if (reuseport) {
 				phash = inet_ehashfn(net, daddr, hnum,
 						     saddr, sport);
-				if (select_ok) {
-					struct sock *sk2;
-					sk2 = reuseport_select_sock(sk, phash,
-								    skb, doff);
-					if (sk2) {
-						result = sk2;
-						goto found;
-					}
-				}
+				result = reuseport_select_sock(sk, phash,
+							       skb, doff);
+				if (result)
+					return result;
 				matches = 1;
 			}
+			result = sk;
+			hiscore = score;
 		} else if (score == hiscore && reuseport) {
 			matches++;
 			if (reciprocal_scale(phash, matches) == 0)
@@ -252,25 +248,6 @@ begin:
 			phash = next_pseudo_random32(phash);
 		}
 	}
-	/*
-	 * if the nulls value we got at the end of this lookup is
-	 * not the expected one, we must restart lookup.
-	 * We probably met an item that was moved to another chain.
-	 */
-	if (get_nulls_value(node) != hash + LISTENING_NULLS_BASE)
-		goto begin;
-	if (result) {
-found:
-		if (unlikely(!atomic_inc_not_zero(&result->sk_refcnt)))
-			result = NULL;
-		else if (unlikely(compute_score(result, net, hnum, daddr,
-				  dif) < hiscore)) {
-			sock_put(result);
-			select_ok = false;
-			goto begin;
-		}
-	}
-	rcu_read_unlock();
 	return result;
 }
 EXPORT_SYMBOL_GPL(__inet_lookup_listener);
@@ -300,7 +277,7 @@ struct sock *__inet_lookup_established(struct net *net,
 				  struct inet_hashinfo *hashinfo,
 				  const __be32 saddr, const __be16 sport,
 				  const __be32 daddr, const u16 hnum,
-				  const int dif)
+				  const int dif, const int sdif)
 {
 	INET_ADDR_COOKIE(acookie, saddr, daddr);
 	const __portpair ports = INET_COMBINED_PORTS(sport, hnum);
@@ -313,17 +290,17 @@ struct sock *__inet_lookup_established(struct net *net,
 	unsigned int slot = hash & hashinfo->ehash_mask;
 	struct inet_ehash_bucket *head = &hashinfo->ehash[slot];
 
-	rcu_read_lock();
 begin:
 	sk_nulls_for_each_rcu(sk, node, &head->chain) {
 		if (sk->sk_hash != hash)
 			continue;
 		if (likely(INET_MATCH(sk, net, acookie,
-				      saddr, daddr, ports, dif))) {
+				      saddr, daddr, ports, dif, sdif))) {
 			if (unlikely(!atomic_inc_not_zero(&sk->sk_refcnt)))
 				goto out;
 			if (unlikely(!INET_MATCH(sk, net, acookie,
-						 saddr, daddr, ports, dif))) {
+						 saddr, daddr, ports,
+						 dif, sdif))) {
 				sock_gen_put(sk);
 				goto begin;
 			}
@@ -340,7 +317,6 @@ begin:
 out:
 	sk = NULL;
 found:
-	rcu_read_unlock();
 	return sk;
 }
 EXPORT_SYMBOL_GPL(__inet_lookup_established);
@@ -355,9 +331,10 @@ static int __inet_check_established(struct inet_timewait_death_row *death_row,
 	__be32 daddr = inet->inet_rcv_saddr;
 	__be32 saddr = inet->inet_daddr;
 	int dif = sk->sk_bound_dev_if;
+	struct net *net = sock_net(sk);
+	int sdif = l3mdev_master_ifindex_by_index(net, dif);
 	INET_ADDR_COOKIE(acookie, saddr, daddr);
 	const __portpair ports = INET_COMBINED_PORTS(inet->inet_dport, lport);
-	struct net *net = sock_net(sk);
 	unsigned int hash = inet_ehashfn(net, daddr, lport,
 					 saddr, inet->inet_dport);
 	struct inet_ehash_bucket *head = inet_ehash_bucket(hinfo, hash);
@@ -373,7 +350,7 @@ static int __inet_check_established(struct inet_timewait_death_row *death_row,
 			continue;
 
 		if (likely(INET_MATCH(sk2, net, acookie,
-					 saddr, daddr, ports, dif))) {
+					 saddr, daddr, ports, dif, sdif))) {
 			if (sk2->sk_state == TCP_TIME_WAIT) {
 				tw = inet_twsk(sk2);
 				if (twsk_unique(sk, sk2, twp))
@@ -473,10 +450,9 @@ static int inet_reuseport_add_sock(struct sock *sk,
 {
 	struct inet_bind_bucket *tb = inet_csk(sk)->icsk_bind_hash;
 	struct sock *sk2;
-	struct hlist_nulls_node *node;
 	kuid_t uid = sock_i_uid(sk);
 
-	sk_nulls_for_each_rcu(sk2, node, &ilb->head) {
+	sk_for_each_rcu(sk2, &ilb->head) {
 		if (sk2 != sk &&
 		    sk2->sk_family == sk->sk_family &&
 		    ipv6_only_sock(sk2) == ipv6_only_sock(sk) &&
@@ -512,7 +488,8 @@ int __inet_hash(struct sock *sk, struct sock *osk,
 		if (err)
 			goto unlock;
 	}
-	__sk_nulls_add_node_rcu(sk, &ilb->head);
+	hlist_add_head_rcu(&sk->sk_node, &ilb->head);
+	sock_set_flag(sk, SOCK_RCU_FREE);
 	sock_prot_inuse_add(sock_net(sk), sk->sk_prot, 1);
 unlock:
 	spin_unlock(&ilb->lock);
@@ -539,25 +516,42 @@ void inet_unhash(struct sock *sk)
 {
 	struct inet_hashinfo *hashinfo = sk->sk_prot->h.hashinfo;
 	spinlock_t *lock;
+	bool listener = false;
 	int done;
 
 	if (sk_unhashed(sk))
 		return;
 
-	if (sk->sk_state == TCP_LISTEN)
+	if (sk->sk_state == TCP_LISTEN) {
 		lock = &hashinfo->listening_hash[inet_sk_listen_hashfn(sk)].lock;
-	else
+		listener = true;
+	} else {
 		lock = inet_ehash_lockp(hashinfo, sk->sk_hash);
-
+	}
 	spin_lock_bh(lock);
 	if (rcu_access_pointer(sk->sk_reuseport_cb))
 		reuseport_detach_sock(sk);
-	done = __sk_nulls_del_node_init_rcu(sk);
+	if (listener)
+		done = __sk_del_node_init(sk);
+	else
+		done = __sk_nulls_del_node_init_rcu(sk);
 	if (done)
 		sock_prot_inuse_add(sock_net(sk), sk->sk_prot, -1);
 	spin_unlock_bh(lock);
 }
 EXPORT_SYMBOL_GPL(inet_unhash);
+
+/* RFC 6056 3.3.4.  Algorithm 4: Double-Hash Port Selection Algorithm
+ * Note that we use 32bit integers (vs RFC 'short integers')
+ * because 2^16 is not a multiple of num_ephemeral and this
+ * property might be used by clever attacker.
+ * RFC claims using TABLE_LENGTH=10 buckets gives an improvement,
+ * we use 256 instead to really give more isolation and
+ * privacy, this only consumes 1 KB of kernel memory.
+ */
+#define INET_TABLE_PERTURB_SHIFT 8
+#define INET_TABLE_PERTURB_SIZE (1 << INET_TABLE_PERTURB_SHIFT)
+static u32 *table_perturb;
 
 int __inet_hash_connect(struct inet_timewait_death_row *death_row,
 		struct sock *sk, u32 port_offset,
@@ -573,9 +567,15 @@ int __inet_hash_connect(struct inet_timewait_death_row *death_row,
 
 	if (!snum) {
 		int i, remaining, low, high, port;
-		static u32 hint;
-		u32 offset = hint + port_offset;
+		u32 index;
+		u32 offset;
 		struct inet_timewait_sock *tw = NULL;
+
+		net_get_random_once(table_perturb,
+				    INET_TABLE_PERTURB_SIZE * sizeof(*table_perturb));
+		index = hash_32(port_offset, INET_TABLE_PERTURB_SHIFT);
+
+		offset = READ_ONCE(table_perturb[index]) + port_offset;
 
 		inet_get_local_port_range(net, &low, &high);
 		remaining = (high - low) + 1;
@@ -631,7 +631,7 @@ int __inet_hash_connect(struct inet_timewait_death_row *death_row,
 		return -EADDRNOTAVAIL;
 
 ok:
-		hint += (i + 2) & ~1;
+		WRITE_ONCE(table_perturb[index], READ_ONCE(table_perturb[index]) + (i + 2) & ~1);
 
 		/* Head lock still held and bh's disabled */
 		inet_bind_hash(sk, tb, port);
@@ -688,9 +688,17 @@ void inet_hashinfo_init(struct inet_hashinfo *h)
 
 	for (i = 0; i < INET_LHTABLE_SIZE; i++) {
 		spin_lock_init(&h->listening_hash[i].lock);
-		INIT_HLIST_NULLS_HEAD(&h->listening_hash[i].head,
-				      i + LISTENING_NULLS_BASE);
-		}
+		INIT_HLIST_HEAD(&h->listening_hash[i].head);
+	}
+
+	if (table_perturb)
+		return;
+
+	/* this one is used for source ports of outgoing connections */
+	table_perturb = kmalloc_array(INET_TABLE_PERTURB_SIZE,
+				      sizeof(*table_perturb), GFP_KERNEL);
+	if (!table_perturb)
+		panic("TCP: failed to alloc table_perturb");
 }
 EXPORT_SYMBOL_GPL(inet_hashinfo_init);
 

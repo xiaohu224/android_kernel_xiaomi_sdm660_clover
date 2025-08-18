@@ -77,26 +77,57 @@ __LL_SC_PREFIX(atomic_##op##_return##name(int i, atomic_t *v))		\
 }									\
 __LL_SC_EXPORT(atomic_##op##_return##name);
 
+#define ATOMIC_FETCH_OP(name, mb, acq, rel, cl, op, asm_op)		\
+__LL_SC_INLINE int							\
+__LL_SC_PREFIX(atomic_fetch_##op##name(int i, atomic_t *v))		\
+{									\
+	unsigned long tmp;						\
+	int val, result;						\
+									\
+	asm volatile("// atomic_fetch_" #op #name "\n"			\
+"	prfm	pstl1strm, %3\n"					\
+"1:	ld" #acq "xr	%w0, %3\n"					\
+"	" #asm_op "	%w1, %w0, %w4\n"				\
+"	st" #rel "xr	%w2, %w1, %3\n"					\
+"	cbnz	%w2, 1b\n"						\
+"	" #mb								\
+	: "=&r" (result), "=&r" (val), "=&r" (tmp), "+Q" (v->counter)	\
+	: "Ir" (i)							\
+	: cl);								\
+									\
+	return result;							\
+}									\
+__LL_SC_EXPORT(atomic_fetch_##op##name);
+
 #define ATOMIC_OPS(...)							\
 	ATOMIC_OP(__VA_ARGS__)						\
-	ATOMIC_OP_RETURN(        , dmb ish,  , l, "memory", __VA_ARGS__)
-
-#define ATOMIC_OPS_RLX(...)						\
-	ATOMIC_OPS(__VA_ARGS__)						\
+	ATOMIC_OP_RETURN(        , dmb ish,  , l, "memory", __VA_ARGS__)\
 	ATOMIC_OP_RETURN(_relaxed,        ,  ,  ,         , __VA_ARGS__)\
 	ATOMIC_OP_RETURN(_acquire,        , a,  , "memory", __VA_ARGS__)\
-	ATOMIC_OP_RETURN(_release,        ,  , l, "memory", __VA_ARGS__)
+	ATOMIC_OP_RETURN(_release,        ,  , l, "memory", __VA_ARGS__)\
+	ATOMIC_FETCH_OP (        , dmb ish,  , l, "memory", __VA_ARGS__)\
+	ATOMIC_FETCH_OP (_relaxed,        ,  ,  ,         , __VA_ARGS__)\
+	ATOMIC_FETCH_OP (_acquire,        , a,  , "memory", __VA_ARGS__)\
+	ATOMIC_FETCH_OP (_release,        ,  , l, "memory", __VA_ARGS__)
 
-ATOMIC_OPS_RLX(add, add)
-ATOMIC_OPS_RLX(sub, sub)
+ATOMIC_OPS(add, add)
+ATOMIC_OPS(sub, sub)
 
-ATOMIC_OP(and, and)
-ATOMIC_OP(andnot, bic)
-ATOMIC_OP(or, orr)
-ATOMIC_OP(xor, eor)
-
-#undef ATOMIC_OPS_RLX
 #undef ATOMIC_OPS
+#define ATOMIC_OPS(...)							\
+	ATOMIC_OP(__VA_ARGS__)						\
+	ATOMIC_FETCH_OP (        , dmb ish,  , l, "memory", __VA_ARGS__)\
+	ATOMIC_FETCH_OP (_relaxed,        ,  ,  ,         , __VA_ARGS__)\
+	ATOMIC_FETCH_OP (_acquire,        , a,  , "memory", __VA_ARGS__)\
+	ATOMIC_FETCH_OP (_release,        ,  , l, "memory", __VA_ARGS__)
+
+ATOMIC_OPS(and, and)
+ATOMIC_OPS(andnot, bic)
+ATOMIC_OPS(or, orr)
+ATOMIC_OPS(xor, eor)
+
+#undef ATOMIC_OPS
+#undef ATOMIC_FETCH_OP
 #undef ATOMIC_OP_RETURN
 #undef ATOMIC_OP
 
@@ -140,26 +171,57 @@ __LL_SC_PREFIX(atomic64_##op##_return##name(long i, atomic64_t *v))	\
 }									\
 __LL_SC_EXPORT(atomic64_##op##_return##name);
 
+#define ATOMIC64_FETCH_OP(name, mb, acq, rel, cl, op, asm_op)		\
+__LL_SC_INLINE long							\
+__LL_SC_PREFIX(atomic64_fetch_##op##name(long i, atomic64_t *v))	\
+{									\
+	long result, val;						\
+	unsigned long tmp;						\
+									\
+	asm volatile("// atomic64_fetch_" #op #name "\n"		\
+"	prfm	pstl1strm, %3\n"					\
+"1:	ld" #acq "xr	%0, %3\n"					\
+"	" #asm_op "	%1, %0, %4\n"					\
+"	st" #rel "xr	%w2, %1, %3\n"					\
+"	cbnz	%w2, 1b\n"						\
+"	" #mb								\
+	: "=&r" (result), "=&r" (val), "=&r" (tmp), "+Q" (v->counter)	\
+	: "Ir" (i)							\
+	: cl);								\
+									\
+	return result;							\
+}									\
+__LL_SC_EXPORT(atomic64_fetch_##op##name);
+
 #define ATOMIC64_OPS(...)						\
 	ATOMIC64_OP(__VA_ARGS__)					\
-	ATOMIC64_OP_RETURN(, dmb ish,  , l, "memory", __VA_ARGS__)
-
-#define ATOMIC64_OPS_RLX(...)						\
-	ATOMIC64_OPS(__VA_ARGS__)					\
+	ATOMIC64_OP_RETURN(, dmb ish,  , l, "memory", __VA_ARGS__)	\
 	ATOMIC64_OP_RETURN(_relaxed,,  ,  ,         , __VA_ARGS__)	\
 	ATOMIC64_OP_RETURN(_acquire,, a,  , "memory", __VA_ARGS__)	\
-	ATOMIC64_OP_RETURN(_release,,  , l, "memory", __VA_ARGS__)
+	ATOMIC64_OP_RETURN(_release,,  , l, "memory", __VA_ARGS__)	\
+	ATOMIC64_FETCH_OP (, dmb ish,  , l, "memory", __VA_ARGS__)	\
+	ATOMIC64_FETCH_OP (_relaxed,,  ,  ,         , __VA_ARGS__)	\
+	ATOMIC64_FETCH_OP (_acquire,, a,  , "memory", __VA_ARGS__)	\
+	ATOMIC64_FETCH_OP (_release,,  , l, "memory", __VA_ARGS__)
 
-ATOMIC64_OPS_RLX(add, add)
-ATOMIC64_OPS_RLX(sub, sub)
+ATOMIC64_OPS(add, add)
+ATOMIC64_OPS(sub, sub)
 
-ATOMIC64_OP(and, and)
-ATOMIC64_OP(andnot, bic)
-ATOMIC64_OP(or, orr)
-ATOMIC64_OP(xor, eor)
-
-#undef ATOMIC64_OPS_RLX
 #undef ATOMIC64_OPS
+#define ATOMIC64_OPS(...)						\
+	ATOMIC64_OP(__VA_ARGS__)					\
+	ATOMIC64_FETCH_OP (, dmb ish,  , l, "memory", __VA_ARGS__)	\
+	ATOMIC64_FETCH_OP (_relaxed,,  ,  ,         , __VA_ARGS__)	\
+	ATOMIC64_FETCH_OP (_acquire,, a,  , "memory", __VA_ARGS__)	\
+	ATOMIC64_FETCH_OP (_release,,  , l, "memory", __VA_ARGS__)
+
+ATOMIC64_OPS(and, and)
+ATOMIC64_OPS(andnot, bic)
+ATOMIC64_OPS(or, orr)
+ATOMIC64_OPS(xor, eor)
+
+#undef ATOMIC64_OPS
+#undef ATOMIC64_FETCH_OP
 #undef ATOMIC64_OP_RETURN
 #undef ATOMIC64_OP
 
@@ -265,5 +327,55 @@ __CMPXCHG_DBL(   ,        ,  ,         )
 __CMPXCHG_DBL(_mb, dmb ish, l, "memory")
 
 #undef __CMPXCHG_DBL
+
+#define REFCOUNT_OP(op, asm_op, pre, post, l)				\
+__LL_SC_INLINE int							\
+__LL_SC_PREFIX(__refcount_##op(int i, atomic_t *r))			\
+{									\
+	unsigned int tmp;						\
+	int result;							\
+									\
+	asm volatile("// refcount_" #op "\n"				\
+"	prfm		pstl1strm, %[cval]\n"				\
+"1:	ldxr		%w1, %[cval]\n"					\
+"	" #asm_op "	%w[val], %w1, %w[i]\n"				\
+	REFCOUNT_PRE_CHECK_ ## pre (%w1)				\
+"	st" #l "xr	%w1, %w[val], %[cval]\n"			\
+"	cbnz		%w1, 1b\n"					\
+	REFCOUNT_POST_CHECK_ ## post					\
+	: [val] "=&r"(result), "=&r"(tmp), [cval] "+Q"(r->counter)	\
+	: [counter] "r"(&r->counter), [i] "Ir" (i)			\
+	: "cc");							\
+									\
+	return result;							\
+}									\
+__LL_SC_EXPORT(__refcount_##op);
+
+REFCOUNT_OP(add_lt, adds, ZERO, NEG_OR_ZERO,  );
+REFCOUNT_OP(sub_lt, subs, NONE, NEG,         l);
+REFCOUNT_OP(sub_le, subs, NONE, NEG_OR_ZERO, l);
+
+__LL_SC_INLINE int
+__LL_SC_PREFIX(__refcount_add_not_zero(int i, atomic_t *r))
+{
+	unsigned int tmp;
+	int result;
+
+	asm volatile("// refcount_add_not_zero\n"
+"	prfm	pstl1strm, %[cval]\n"
+"1:	ldxr	%w[val], %[cval]\n"
+"	cbz	%w[val], 2f\n"
+"	adds	%w[val], %w[val], %w[i]\n"
+"	stxr	%w1, %w[val], %[cval]\n"
+"	cbnz	%w1, 1b\n"
+	REFCOUNT_POST_CHECK_NEG
+"2:"
+	: [val] "=&r" (result), "=&r" (tmp), [cval] "+Q" (r->counter)
+	: [counter] "r"(&r->counter), [i] "Ir" (i)
+	: "cc");
+
+	return result;
+}
+__LL_SC_EXPORT(__refcount_add_not_zero);
 
 #endif	/* __ASM_ATOMIC_LL_SC_H */

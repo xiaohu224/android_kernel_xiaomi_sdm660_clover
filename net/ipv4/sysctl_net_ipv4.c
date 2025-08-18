@@ -274,7 +274,7 @@ static int proc_tcp_fastopen_key(struct ctl_table *ctl, int write,
 		for (i = 0; i < ARRAY_SIZE(user_key); i++)
 			key[i] = cpu_to_le32(user_key[i]);
 
-		tcp_fastopen_reset_cipher(key, TCP_FASTOPEN_KEY_LENGTH);
+		tcp_fastopen_reset_cipher(NULL, key, TCP_FASTOPEN_KEY_LENGTH);
 	}
 
 bad_key:
@@ -282,6 +282,38 @@ bad_key:
 		 user_key[0], user_key[1], user_key[2], user_key[3],
 	       (char *)tbl.data, ret);
 	kfree(tbl.data);
+	return ret;
+}
+
+static int proc_tfo_blackhole_detect_timeout(struct ctl_table *table,
+					     int write,
+					     void __user *buffer,
+					     size_t *lenp, loff_t *ppos)
+{
+	int ret;
+
+	ret = proc_dointvec_minmax(table, write, buffer, lenp, ppos);
+	if (write && ret == 0)
+		tcp_fastopen_active_timeout_reset();
+
+	return ret;
+}
+
+static int proc_tcp_available_ulp(struct ctl_table *ctl,
+				  int write,
+				  void __user *buffer, size_t *lenp,
+				  loff_t *ppos)
+{
+	struct ctl_table tbl = { .maxlen = TCP_ULP_BUF_MAX, };
+	int ret;
+
+	tbl.data = kmalloc(tbl.maxlen, GFP_USER);
+	if (!tbl.data)
+		return -ENOMEM;
+	tcp_get_available_ulp(tbl.data, TCP_ULP_BUF_MAX);
+	ret = proc_dostring(&tbl, write, buffer, lenp, ppos);
+	kfree(tbl.data);
+
 	return ret;
 }
 
@@ -431,6 +463,14 @@ static struct ctl_table ipv4_table[] = {
 		.mode		= 0600,
 		.maxlen		= ((TCP_FASTOPEN_KEY_LENGTH * 2) + 10),
 		.proc_handler	= proc_tcp_fastopen_key,
+	},
+	{
+		.procname	= "tcp_fastopen_blackhole_timeout_sec",
+		.data		= &sysctl_tcp_fastopen_blackhole_timeout,
+		.maxlen		= sizeof(int),
+		.mode		= 0644,
+		.proc_handler	= proc_tfo_blackhole_detect_timeout,
+		.extra1		= &zero,
 	},
 	{
 		.procname	= "tcp_tw_recycle",
@@ -735,13 +775,6 @@ static struct ctl_table ipv4_table[] = {
 		.proc_handler   = proc_dointvec
 	},
 	{
-		.procname       = "tcp_thin_dupack",
-		.data           = &sysctl_tcp_thin_dupack,
-		.maxlen         = sizeof(int),
-		.mode           = 0644,
-		.proc_handler   = proc_dointvec
-	},
-	{
 		.procname	= "tcp_early_retrans",
 		.data		= &sysctl_tcp_early_retrans,
 		.maxlen		= sizeof(int),
@@ -799,6 +832,12 @@ static struct ctl_table ipv4_table[] = {
 		.maxlen         = sizeof(int),
 		.mode           = 0644,
 		.proc_handler   = proc_tcp_default_init_rwnd
+	},
+	{
+		.procname	= "tcp_available_ulp",
+		.maxlen		= TCP_ULP_BUF_MAX,
+		.mode		= 0444,
+		.proc_handler   = proc_tcp_available_ulp,
 	},
 	{
 		.procname	= "icmp_msgs_per_sec",
@@ -1025,6 +1064,17 @@ static struct ctl_table ipv4_net_table[] = {
 		.mode		= 0644,
 		.proc_handler	= proc_dointvec
 	},
+#ifdef CONFIG_NET_L3_MASTER_DEV
+	{
+		.procname	= "udp_l3mdev_accept",
+		.data		= &init_net.ipv4.sysctl_udp_l3mdev_accept,
+		.maxlen		= sizeof(int),
+		.mode		= 0644,
+		.proc_handler	= proc_dointvec_minmax,
+		.extra1		= &zero,
+		.extra2		= &one,
+	},
+#endif
 	{ }
 };
 
